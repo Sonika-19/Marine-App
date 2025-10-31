@@ -8,14 +8,14 @@ import os
 
 # ---------- CONFIG ----------
 DB_USER = "root"
-DB_PASSWORD = "Password"   # kept from original snippet
+DB_PASSWORD = "password"   # kept from original snippet
 DB_HOST = "localhost"
 DB_NAME = "marine_db"
 
 # Path provided by you (Windows). If you keep SQL in another path, change this.
-DEFAULT_SQL_PATH = r"C:\Users\klson\OneDrive\Desktop\marine_new\marine_species_project.sql"
+DEFAULT_SQL_PATH = r"C:\Users\klson\OneDrive\Desktop\marine_species_projectold.sql"
 # Also keep fallback to uploaded file location used during development/testing
-FALLBACK_SQL_PATH = "/mnt/data/marine_species_project.sql"
+FALLBACK_SQL_PATH = "/mnt/data/marine_species_projectold.sql"
 
 # ---------- DB CONNECTION ----------
 def get_db_connection(database=DB_NAME):
@@ -174,6 +174,39 @@ def fetch_all_observers():
     conn.close()
     return rows
 
+def fetch_all_observations_full():
+    """ Fetches all observations with key details for management. """
+    conn = get_db_connection()
+    if not conn: return pd.DataFrame()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT o.obs_id, s.common_name, l.location_name, obs.name as observer_name, o.obs_date, o.count_observed
+        FROM Observation o
+        LEFT JOIN Species s ON o.species_id = s.species_id
+        LEFT JOIN Location l ON o.location_id = l.location_id
+        LEFT JOIN Observer obs ON o.observer_id = obs.observer_id
+        ORDER BY o.obs_date DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return pd.DataFrame(rows)
+
+def fetch_all_actions_full():
+    """ Fetches all conservation actions with key details. """
+    conn = get_db_connection()
+    if not conn: return pd.DataFrame()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT ca.action_id, s.common_name, ca.action_type, ca.description, ca.start_date, ca.end_date
+        FROM Conservation_Action ca
+        JOIN Species s ON ca.species_id = s.species_id
+        ORDER BY ca.start_date DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return pd.DataFrame(rows)
+
+
 def add_species(common_name, scientific_name, conservation_status):
     conn = get_db_connection()
     if not conn:
@@ -290,15 +323,153 @@ def fetch_recent_observations(limit=10):
     conn.close()
     return pd.DataFrame(rows)
 
+def fetch_one_record(table_name, id_column, record_id):
+    """ Fetches a single record to pre-fill update forms. """
+    conn = get_db_connection()
+    if not conn:
+        return None, "DB connection failed"
+    
+    # Whitelist
+    if table_name not in ['Species', 'Observer', 'Location', 'Conservation_Action']:
+        return None, "Invalid table name for update."
+    if id_column not in ['species_id', 'observer_id', 'location_id', 'action_id']:
+        return None, "Invalid ID column."
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        query = f"SELECT * FROM {table_name} WHERE {id_column} = %s"
+        cursor.execute(query, (record_id,))
+        record = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if not record:
+            return None, "Record not found."
+        return record, "Success"
+    except mysql.connector.Error as e:
+        return None, str(e)
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+def update_record(table_name, id_column, record_id, update_data):
+    """
+    Safely updates a record.
+    update_data is a dict {'column_name': new_value}
+    """
+    conn = get_db_connection()
+    if not conn:
+        return False, "DB connection failed"
+    
+    # Whitelist tables and columns
+    if table_name not in ['Species', 'Observer', 'Location', 'Conservation_Action']:
+        return False, "Invalid table name for update."
+    if id_column not in ['species_id', 'observer_id', 'location_id', 'action_id']:
+        return False, "Invalid ID column."
+
+    # Build the SET part of the query
+    set_clause = []
+    values = []
+    
+    # Whitelist columns for each table
+    allowed_columns = {
+        'Species': ['common_name', 'scientific_name', 'conservation_status'],
+        'Observer': ['name', 'organization', 'contact'],
+        'Location': ['location_name', 'region', 'water_type'],
+        'Conservation_Action': ['action_type', 'description', 'start_date', 'end_date']
+    }
+    
+    if table_name not in allowed_columns:
+         return False, f"Update not configured for table {table_name}."
+         
+    for col, val in update_data.items():
+        if col in allowed_columns[table_name]:
+            set_clause.append(f"{col} = %s")
+            values.append(val)
+        else:
+            # This should ideally not be hit if form is correct, but as a safeguard.
+            st.error(f"Attempted to update non-whitelisted column: {col}")
+            continue # Skip this column
+
+    if not set_clause:
+        return False, "No valid data provided for update."
+
+    values.append(record_id) # for the WHERE clause
+    
+    try:
+        cursor = conn.cursor()
+        query = f"UPDATE {table_name} SET {', '.join(set_clause)} WHERE {id_column} = %s"
+        
+        cursor.execute(query, tuple(values))
+        conn.commit()
+        
+        rows_affected = cursor.rowcount
+        cursor.close()
+        
+        if rows_affected == 0:
+            return False, "Record not found or data was unchanged."
+        return True, f"Record {record_id} in {table_name} updated."
+        
+    except mysql.connector.Error as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+def delete_record(table_name, id_column, record_id):
+    """
+    Safely deletes a record by its ID, with whitelist validation and FK error handling.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return False, "DB connection failed"
+    
+    # Whitelist tables and columns to prevent SQL injection
+    if table_name not in ['Species', 'Observer', 'Location', 'Observation', 'Conservation_Action', 'Water_Quality']:
+        return False, "Invalid table name."
+    if id_column not in ['species_id', 'observer_id', 'location_id', 'obs_id', 'action_id', 'quality_id']:
+        return False, "Invalid ID column."
+
+    try:
+        cursor = conn.cursor()
+        # f-string is safe here due to the whitelist check above
+        query = f"DELETE FROM {table_name} WHERE {id_column} = %s"
+        cursor.execute(query, (record_id,))
+        
+        conn.commit()
+        rows_affected = cursor.rowcount
+        cursor.close()
+        
+        if rows_affected == 0:
+            return False, "Record not found or already deleted."
+        return True, f"Record {record_id} deleted from {table_name}."
+        
+    except mysql.connector.Error as e:
+        conn.rollback()
+        # Check for foreign key constraint error (e.g., 1451)
+        if e.errno == 1451:
+            return False, f"Cannot delete: This record is being referenced by other data (Foreign Key constraint)."
+        return False, str(e)
+    finally:
+        if conn.is_connected():
+            conn.close()
+
 # ---------- STREAMLIT UI ----------
 def main():
     st.set_page_config(page_title="Marine Species Conservation", page_icon="🐟", layout="wide")
 
     st.sidebar.title("Marine Conservation")
     st.sidebar.markdown("---")
-    menu = st.sidebar.radio("Navigation", [
-        "Dashboard", "Add Observation", "Add Species/Observer", "Search Species", "Conservation Actions", "DB Init"
-    ])
+    menu_options = [
+        "Dashboard", 
+        "Add Observation", 
+        "Add Species/Observer", 
+        "Search Species", 
+        "Conservation Actions", 
+        "Manage Data", # <-- RENAMED
+        "DB Init"
+    ]
+    menu = st.sidebar.radio("Navigation", menu_options)
 
     # ---------- DB INIT ----------
     if menu == "DB Init":
@@ -533,6 +704,228 @@ def main():
         else:
             st.info("No conservation actions recorded")
         conn.close()
+
+    # ---------- MANAGE DATA (UPDATE/DELETE) ----------
+    elif menu == "Manage Data":
+        st.title("✏️ Manage Data")
+        
+        tab_update, tab_delete = st.tabs(["Update Records", "Delete Records"])
+
+        # ---------- UPDATE TAB ----------
+        with tab_update:
+            st.subheader("Update a Record")
+            st.info("Select a record to load its data into the form below for editing.")
+            
+            table_to_update = st.selectbox(
+                "Which data do you want to update?", 
+                ["Select...", "Species", "Observers", "Locations", "Conservation Actions"],
+                key="update_table_select"
+            )
+            
+            record_to_update_id = None
+            record_data = None
+            msg = ""
+            
+            if table_to_update == "Species":
+                data = pd.DataFrame(fetch_all_species())
+                if not data.empty:
+                    display_options = data.apply(lambda row: f"ID {row['species_id']}: {row['common_name']}", axis=1)
+                    id_map = dict(zip(display_options, data['species_id']))
+                    selected_display = st.selectbox("Select Species to Update:", ["Select..."] + list(display_options))
+                    
+                    if selected_display != "Select...":
+                        record_to_update_id = id_map[selected_display]
+                        record_data, msg = fetch_one_record("Species", "species_id", record_to_update_id)
+
+            elif table_to_update == "Observers":
+                data = pd.DataFrame(fetch_all_observers())
+                if not data.empty:
+                    display_options = data.apply(lambda row: f"ID {row['observer_id']}: {row['name']} ({row['organization']})", axis=1)
+                    id_map = dict(zip(display_options, data['observer_id']))
+                    selected_display = st.selectbox("Select Observer to Update:", ["Select..."] + list(display_options))
+                    
+                    if selected_display != "Select...":
+                        record_to_update_id = id_map[selected_display]
+                        record_data, msg = fetch_one_record("Observer", "observer_id", record_to_update_id)
+
+            elif table_to_update == "Locations":
+                data = pd.DataFrame(fetch_all_locations())
+                if not data.empty:
+                    display_options = data.apply(lambda row: f"ID {row['location_id']}: {row['location_name']}, {row['region']}", axis=1)
+                    id_map = dict(zip(display_options, data['location_id']))
+                    selected_display = st.selectbox("Select Location to Update:", ["Select..."] + list(display_options))
+                    
+                    if selected_display != "Select...":
+                        record_to_update_id = id_map[selected_display]
+                        record_data, msg = fetch_one_record("Location", "location_id", record_to_update_id)
+            
+            elif table_to_update == "Conservation Actions":
+                data = fetch_all_actions_full() # Using the existing full fetch
+                if not data.empty:
+                    display_options = data.apply(lambda row: f"ID {row['action_id']}: {row['action_type']} for {row['common_name']}", axis=1)
+                    id_map = dict(zip(display_options, data['action_id']))
+                    selected_display = st.selectbox("Select Action to Update:", ["Select..."] + list(display_options))
+                    
+                    if selected_display != "Select...":
+                        record_to_update_id = id_map[selected_display]
+                        record_data, msg = fetch_one_record("Conservation_Action", "action_id", record_to_update_id)
+
+            
+            # --- UPDATE FORM ---
+            if record_to_update_id:
+                st.markdown("---")
+                st.subheader(f"Editing Record ID: {record_to_update_id}")
+                
+                if not record_data:
+                    st.error(f"Failed to fetch record data: {msg}")
+                else:
+                    with st.form(key=f"update_form_{table_to_update}_{record_to_update_id}"):
+                        update_payload = {}
+                        
+                        if table_to_update == "Species":
+                            update_payload['common_name'] = st.text_input("Common Name", value=record_data.get('common_name'))
+                            update_payload['scientific_name'] = st.text_input("Scientific Name", value=record_data.get('scientific_name'))
+                            status_options = ["Least Concern", "Near Threatened", "Vulnerable", "Endangered", "Critically Endangered"]
+                            try:
+                                default_index = status_options.index(record_data.get('conservation_status'))
+                            except (ValueError, TypeError):
+                                default_index = 0
+                            update_payload['conservation_status'] = st.selectbox("Conservation Status", status_options, index=default_index)
+                            
+                        elif table_to_update == "Observers":
+                            update_payload['name'] = st.text_input("Name", value=record_data.get('name'))
+                            update_payload['organization'] = st.text_input("Organization", value=record_data.get('organization'))
+                            update_payload['contact'] = st.text_input("Contact", value=record_data.get('contact'))
+
+                        elif table_to_update == "Locations":
+                            update_payload['location_name'] = st.text_input("Location Name", value=record_data.get('location_name'))
+                            update_payload['region'] = st.text_input("Region", value=record_data.get('region'))
+                            water_options = ['Ocean', 'Sea', 'Lake', 'River']
+                            try:
+                                default_index = water_options.index(record_data.get('water_type'))
+                            except (ValueError, TypeError):
+                                default_index = 0
+                            update_payload['water_type'] = st.selectbox("Water Type", water_options, index=default_index)
+
+                        elif table_to_update == "Conservation Actions":
+                            update_payload['action_type'] = st.text_input("Action Type", value=record_data.get('action_type'))
+                            update_payload['description'] = st.text_area("Description", value=record_data.get('description'))
+                            update_payload['start_date'] = st.date_input("Start Date", value=record_data.get('start_date'))
+                            update_payload['end_date'] = st.date_input("End Date", value=record_data.get('end_date'))
+                        
+                        
+                        submitted = st.form_submit_button("Submit Update")
+                        if submitted:
+                            table_map = {
+                                "Species": ("Species", "species_id"),
+                                "Observers": ("Observer", "observer_id"),
+                                "Locations": ("Location", "location_id"),
+                                "Conservation Actions": ("Conservation_Action", "action_id")
+                            }
+                            table_name, id_column = table_map[table_to_update]
+                            
+                            ok, msg = update_record(table_name, id_column, record_to_update_id, update_payload)
+                            
+                            if ok:
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(f"Update failed: {msg}")
+
+        # ---------- DELETE TAB ----------
+        with tab_delete:
+            st.subheader("Delete Records")
+            st.warning("⚠️ **Warning:** Deleting records is permanent. Deletions may fail if the record is referenced by other data (e.g., deleting a Species that has Observations).")
+
+            table_to_manage = st.selectbox(
+                "Which data do you want to delete?", 
+                ["Select...", "Species", "Observers", "Locations", "Observations", "Conservation Actions"],
+                key="delete_table_select" # Add key to make it unique
+            )
+            
+            data = pd.DataFrame()
+            options = []
+            display_options = []
+            
+            if table_to_manage == "Species":
+                data = pd.DataFrame(fetch_all_species())
+                if not data.empty:
+                    st.dataframe(data, use_container_width=True)
+                    options = data['species_id']
+                    display_options = data.apply(lambda row: f"ID {row['species_id']}: {row['common_name']}", axis=1)
+            
+            elif table_to_manage == "Observers":
+                data = pd.DataFrame(fetch_all_observers())
+                if not data.empty:
+                    st.dataframe(data, use_container_width=True)
+                    options = data['observer_id']
+                    display_options = data.apply(lambda row: f"ID {row['observer_id']}: {row['name']} ({row['organization']})", axis=1)
+
+            elif table_to_manage == "Locations":
+                data = pd.DataFrame(fetch_all_locations())
+                if not data.empty:
+                    st.dataframe(data, use_container_width=True)
+                    options = data['location_id']
+                    display_options = data.apply(lambda row: f"ID {row['location_id']}: {row['location_name']}, {row['region']}", axis=1)
+
+            elif table_to_manage == "Observations":
+                data = fetch_all_observations_full()
+                if not data.empty:
+                    st.dataframe(data, use_container_width=True)
+                    options = data['obs_id']
+                    display_options = data.apply(lambda row: f"ID {row['obs_id']}: {row['common_name']} at {row['location_name']} ({row['obs_date']})", axis=1)
+
+            elif table_to_manage == "Conservation Actions":
+                data = fetch_all_actions_full()
+                if not data.empty:
+                    st.dataframe(data, use_container_width=True)
+                    options = data['action_id']
+                    display_options = data.apply(lambda row: f"ID {row['action_id']}: {row['action_type']} for {row['common_name']}", axis=1)
+
+            # Show delete controls if data is loaded
+            if not data.empty:
+                st.markdown("---")
+                selected_to_delete_display = st.multiselect(
+                    "Select record(s) to delete:", 
+                    options=display_options
+                )
+                
+                # Map display strings back to their corresponding IDs
+                id_map = dict(zip(display_options, options))
+                ids_to_delete = [id_map[display_val] for display_val in selected_to_delete_display]
+
+                if st.button("Delete Selected Records", type="primary"):
+                    if not ids_to_delete:
+                        st.error("Please select at least one record to delete.")
+                    else:
+                        success_count = 0
+                        fail_count = 0
+                        
+                        # Map UI selection to table name and ID column
+                        table_map = {
+                            "Species": ("Species", "species_id"),
+                            "Observers": ("Observer", "observer_id"),
+                            "Locations": ("Location", "location_id"),
+                            "Observations": ("Observation", "obs_id"),
+                            "Conservation Actions": ("Conservation_Action", "action_id")
+                        }
+                        table_name, id_column = table_map[table_to_manage]
+                        
+                        for record_id in ids_to_delete:
+                            ok, msg = delete_record(table_name, id_column, record_id)
+                            if ok:
+                                st.success(msg)
+                                success_count += 1
+                            else:
+                                st.error(f"Failed to delete ID {record_id}: {msg}")
+                                fail_count += 1
+                        
+                        st.info(f"Delete operation complete. {success_count} succeeded, {fail_count} failed.")
+                        st.rerun() # Refresh the data on the page
+            
+            elif table_to_manage != "Select...":
+                st.info("No data in this table to manage.")
+
 
 if __name__ == "__main__":
     main()
